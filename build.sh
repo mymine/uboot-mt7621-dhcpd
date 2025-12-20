@@ -1,0 +1,272 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+# Default values
+DEFAULT_MTDPARTS="512k(u-boot),512k(u-boot-env),256k(factory),-(firmware)"
+DEFAULT_BAUDRATE="115200"
+
+FLASH=""
+MTDPARTS=""
+KERNEL_OFFSET=""
+RESET_PIN="-1"
+SYSLED_PIN="-1"
+CPUFREQ=""
+RAMFREQ=""
+DDRPARM=""
+BAUDRATE="${DEFAULT_BAUDRATE}"
+YES="0"
+
+# Partition defaults
+DEFAULT_UBOOT_SIZE="512k"
+DEFAULT_UBOOT_ENV_SIZE="512k"
+DEFAULT_FACTORY_SIZE="256k"
+
+# Partition sizes (optional, used to build MTDPARTS)
+UBOOT_SIZE=""
+UBOOT_ENV_SIZE=""
+FACTORY_SIZE=""
+
+print_usage() {
+  cat <<EOF
+Usage:
+  ./build.sh                      # 交互式选择
+  ./build.sh [options]            # 非交互式构建
+
+Options:
+  --flash {NOR|NAND|NMBM}         闪存类型
+  --mtdparts STRING               MTD 分区表（不含设备前缀），示例：
+                                  512k(u-boot),512k(u-boot-env),256k(factory),-(firmware)
+  --uboot-size SIZE               u-boot 分区大小（如 512k/1m）
+  --uboot-env-size SIZE           u-boot-env 分区大小（如 512k）
+  --factory-size SIZE             factory 分区大小（如 256k/128k）
+  --kernel-offset VALUE           内核偏移（例如 0x60000 或十进制数）
+  --reset-pin INT                 复位按键 GPIO（0-48，或 -1 禁用）
+  --sysled-pin INT                系统 LED GPIO（0-48，或 -1 禁用）
+  --cpufreq INT                   CPU 频率 MHz（400-1200）
+  --ramfreq {400|800|1066|1200}   DRAM 速率 MT/s
+  --ddrparam NAME                 DDR 参数（从内置列表选择之一或自定义）
+  --baudrate {57600|115200}       串口速率（默认 115200）
+  --yes                           跳过交互确认
+  -h, --help                      显示帮助
+
+示例（非交互）:
+  ./build.sh \
+    --flash NOR \
+    --uboot-size 512k \
+    --uboot-env-size 512k \
+    --factory-size 256k \
+    --kernel-offset 0x60000 \
+    --reset-pin 13 \
+    --sysled-pin 14 \
+    --cpufreq 880 \
+    --ramfreq 1066 \
+    --ddrparam DDR3-256MiB \
+    --baudrate 115200 \
+    --yes
+EOF
+}
+
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --flash) FLASH="$2"; shift 2;;
+      --mtdparts) MTDPARTS="$2"; shift 2;;
+      --uboot-size) UBOOT_SIZE="$2"; shift 2;;
+      --uboot-env-size) UBOOT_ENV_SIZE="$2"; shift 2;;
+      --factory-size) FACTORY_SIZE="$2"; shift 2;;
+      --kernel-offset) KERNEL_OFFSET="$2"; shift 2;;
+      --reset-pin) RESET_PIN="$2"; shift 2;;
+      --sysled-pin) SYSLED_PIN="$2"; shift 2;;
+      --cpufreq) CPUFREQ="$2"; shift 2;;
+      --ramfreq) RAMFREQ="$2"; shift 2;;
+      --ddrparam) DDRPARM="$2"; shift 2;;
+      --baudrate) BAUDRATE="$2"; shift 2;;
+      --yes) YES="1"; shift;;
+      -h|--help) print_usage; exit 0;;
+      *) echo "未知参数: $1"; print_usage; exit 1;;
+    esac
+  done
+}
+
+is_size_token() {
+  local v="$1"
+  [[ "$v" =~ ^[0-9]+[kKmM]$ ]]
+}
+
+build_mtdparts() {
+  local u="${UBOOT_SIZE:-${DEFAULT_UBOOT_SIZE}}"
+  local e="${UBOOT_ENV_SIZE:-${DEFAULT_UBOOT_ENV_SIZE}}"
+  local f="${FACTORY_SIZE:-${DEFAULT_FACTORY_SIZE}}"
+  echo "${u}(u-boot),${e}(u-boot-env),${f}(factory),-(firmware)"
+}
+
+ask() {
+  local prompt="$1"; shift
+  local default_val="${1:-}"; shift || true
+  local var
+  if [[ -n "${default_val}" ]]; then
+    read -r -p "${prompt} [默认: ${default_val}] > " var || true
+    echo "${var:-${default_val}}"
+  else
+    read -r -p "${prompt} > " var || true
+    echo "${var}"
+  fi
+}
+
+select_from() {
+  local prompt="$1"; shift
+  local -a items=("$@")
+  echo "${prompt}" >&2;
+  local i=1
+  for it in "${items[@]}"; do
+    echo "  ${i}) ${it}" >&2
+    ((i++))
+  done
+  read -r -p "选择序号 (输入数字 1-${#items[@]}) > " idx || true
+  if [[ -z "${idx}" ]] || ! [[ "${idx}" =~ ^[0-9]+$ ]] || (( idx < 1 || idx > ${#items[@]} )); then
+    echo ""; return 1
+  fi
+  echo "${items[$((idx-1))]}"
+}
+
+select_with_default() {
+  local prompt="$1"; shift
+  local default_val="$1"; shift
+  local -a items=("$@")
+  echo "${prompt}" >&2;
+  local i=1
+  for it in "${items[@]}"; do
+    echo "  ${i}) ${it}" >&2
+    ((i++))
+  done
+  read -r -p "选择序号 (默认: ${default_val}) > " idx || true
+  if [[ -z "${idx}" ]]; then
+    echo "${default_val}"; return 0
+  fi
+  if ! [[ "${idx}" =~ ^[0-9]+$ ]] || (( idx < 1 || idx > ${#items[@]} )); then
+    echo "${default_val}"; return 0
+  fi
+  echo "${items[$((idx-1))]}"
+}
+
+validate() {
+  # MTDPARTS 格式基本校验（需包含 ),-(firmware)）
+  if [[ -z "${MTDPARTS}" ]] || ! echo -n "${MTDPARTS}" | grep -q "),-(firmware)"; then
+    echo "错误: MTD 分区表格式不合法，示例：${DEFAULT_MTDPARTS}"; exit 1
+  fi
+  # 若提供了独立分区大小，进行基本合法性校验
+  for tok in "${UBOOT_SIZE}" "${UBOOT_ENV_SIZE}" "${FACTORY_SIZE}"; do
+    if [[ -n "$tok" ]] && ! is_size_token "$tok"; then
+      echo "错误: 分区大小需为数字+单位（k/m），例如 512k、1m"; exit 1
+    fi
+  done
+  # FLASH 类型
+  case "${FLASH}" in
+    NOR|NAND|NMBM) :;;
+    *) echo "错误: 请选择 FLASH 类型 NOR/NAND/NMBM"; exit 1;;
+  esac
+  # KERNEL_OFFSET 允许十六进制或十进制
+  if [[ -z "${KERNEL_OFFSET}" ]] || ! [[ "${KERNEL_OFFSET}" =~ ^(0x[0-9a-fA-F]+|[0-9]+)$ ]]; then
+    echo "错误: kernel-offset 需为十六进制(如 0x60000)或十进制"; exit 1
+  fi
+  # GPIO 范围或 -1
+  for p in RESET_PIN SYSLED_PIN; do
+    local val="${!p}"
+    if ! [[ "${val}" =~ ^-?[0-9]+$ ]]; then
+      echo "错误: ${p} 必须是整数（-1 或 0-48）"; exit 1
+    fi
+    if (( val != -1 && (val < 0 || val > 48) )); then
+      echo "错误: ${p} 超出范围（-1 或 0-48）"; exit 1
+    fi
+  done
+  # CPU 频率
+  if [[ -z "${CPUFREQ}" ]] || ! [[ "${CPUFREQ}" =~ ^[0-9]+$ ]] || (( CPUFREQ < 400 || CPUFREQ > 1200 )); then
+    echo "错误: cpufreq 必须是 400-1200 的整数 MHz"; exit 1
+  fi
+  # RAM 频率
+  case "${RAMFREQ}" in
+    400|800|1066|1200) :;;
+    *) echo "错误: ramfreq 仅支持 400/800/1066/1200"; exit 1;;
+  esac
+  # 波特率
+  case "${BAUDRATE}" in
+    57600|115200) :;;
+    *) echo "错误: baudrate 仅支持 57600 或 115200"; exit 1;;
+  esac
+}
+
+interactive() {
+  # FLASH 类型
+  FLASH=$(select_with_default "选择闪存类型:" "NMBM" NOR NAND NMBM)
+  # 分区大小分别询问
+  UBOOT_SIZE=$(ask "u-boot 分区大小 (示例 512k/1m)" "${DEFAULT_UBOOT_SIZE}")
+  UBOOT_ENV_SIZE=$(ask "u-boot-env 分区大小 (示例 512k)" "${DEFAULT_UBOOT_ENV_SIZE}")
+  FACTORY_SIZE=$(ask "factory 分区大小 (示例 256k)" "${DEFAULT_FACTORY_SIZE}")
+  MTDPARTS=$(build_mtdparts)
+  # kernel offset，不同闪存可能不同，这里仅做示例提示
+  local example_offset="0x60000"
+  KERNEL_OFFSET=$(ask "输入内核偏移 (示例 ${example_offset})" "${example_offset}")
+  # GPIO
+  RESET_PIN=$(ask "复位按钮 GPIO (0-48，-1 禁用)" "-1")
+  SYSLED_PIN=$(ask "系统 LED GPIO (0-48，-1 禁用)" "-1")
+  # CPU 频率
+  local cpusel=$(select_with_default "选择 CPU 频率 (MHz)：" "880" 880 1000 1200)
+  CPUFREQ="${cpusel}"
+  # RAM 频率
+  local ramsel=$(select_with_default "选择 DRAM 速率 (MT/s)：" "1066" 400 800 1066 1200)
+  RAMFREQ="${ramsel}"
+  # DDR 参数
+  echo "选择 DDR 初始化参数（或留空自定义输入）："
+  local ddrsel=$(select_from "内置列表：" \
+    DDR2-64MiB \
+    DDR2-128MiB \
+    DDR2-W9751G6KB-64MiB-1066MHz \
+    DDR2-W971GG6KB25-128MiB-800MHz \
+    DDR2-W971GG6KB18-128MiB-1066MHz \
+    DDR3-128MiB \
+    DDR3-256MiB \
+    DDR3-512MiB \
+    DDR3-128MiB-KGD) || true
+  if [[ -z "${ddrsel}" ]]; then
+    DDRPARM=$(ask "自定义 DDR 参数（大小写需与 customize.sh 中 case 项一致）" "DDR3-256MiB")
+  else
+    DDRPARM="${ddrsel}"
+  fi
+  # 波特率
+  local brsel=$(select_with_default "选择串口波特率：" "115200" 57600 115200)
+  BAUDRATE="${brsel}"
+}
+
+summary() {
+  cat <<EOF
+将执行：
+  ./customize.sh '${FLASH}' '${MTDPARTS}' '${KERNEL_OFFSET}' '${RESET_PIN}' \
+                  '${SYSLED_PIN}' '${CPUFREQ}' '${RAMFREQ}' '${DDRPARM}' '${BAUDRATE}'
+EOF
+}
+
+main() {
+  parse_args "$@"
+  # 如未直接提供 mtdparts，但提供了各分区大小，则拼接
+  if [[ -z "${MTDPARTS}" ]] && { [[ -n "${UBOOT_SIZE}" ]] || [[ -n "${UBOOT_ENV_SIZE}" ]] || [[ -n "${FACTORY_SIZE}" ]]; }; then
+    MTDPARTS=$(build_mtdparts)
+  fi
+  if [[ -z "${FLASH}" || -z "${MTDPARTS}" || -z "${KERNEL_OFFSET}" || -z "${CPUFREQ}" || -z "${RAMFREQ}" || -z "${DDRPARM}" ]]; then
+    echo "进入交互式配置..."
+    interactive
+  fi
+  validate
+  summary
+  if [[ "${YES}" != "1" ]]; then
+    read -r -p "确认执行？[y/N] " confirm || true
+    if [[ "${confirm,,}" != "y" ]]; then
+      echo "已取消。"; exit 0
+    fi
+  fi
+  ./customize.sh "${FLASH}" "${MTDPARTS}" "${KERNEL_OFFSET}" "${RESET_PIN}" \
+                 "${SYSLED_PIN}" "${CPUFREQ}" "${RAMFREQ}" "${DDRPARM}" "${BAUDRATE}"
+  echo "构建完成。若成功，产物位于 ./archive/。"
+}
+
+main "$@"

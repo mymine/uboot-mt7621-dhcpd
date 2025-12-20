@@ -24,12 +24,18 @@
 *.order
 *.patch
 *.s
+*.so
 *.su
 *.swp
 *.tab.[ch]
 
 # Build tree
 /build-*
+archive/
+
+# Toolchain
+openwrt*/
+openwrt-toolchain*
 
 #
 # Top-level generic files

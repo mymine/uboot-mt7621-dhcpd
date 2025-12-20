@@ -1,4 +1,5 @@
 # MediaTek MT7621 U-Boot with Failsafe Mode
+
 ![Web Recovery Page](WebRecovery.png)
 
 ## Online Build
@@ -10,6 +11,42 @@
 3. Click `Run workflow` and set board specific parameters.
 
 4. U-Boot image will be uploaded to Artifacts.
+
+## Local Build
+
+1. Fork This Repository and clone it to local machine.
+
+2. Install required packages:
+
+   - On Ubuntu22.04:
+
+     ```bash
+     sudo apt-get install git swig python2-dev
+     sudo rm /usr/bin/python
+     # create a symlink for python2
+     sudo ln -s /usr/bin/python2.7 /usr/bin/python2
+     sudo ln -s /usr/bin/python2.7 /usr/bin/python
+     ```
+
+     > if you want to change back: `sudo rm /usr/bin/python`, `sudo ln -s /usr/bin/python3 /usr/bin/python`
+
+3. Get toolchain:
+
+   ```bash
+   wget -O - https://github.com/DragonBluep/uboot-mt7621/releases/download/20230517/openwrt-toolchain-ramips-mt7621_gcc-12.3.0_musl.Linux-x86_64.tar.xz | tar --xz -xf -
+   ```
+
+   > The toolchain and U-Boot should be in the same directory()
+
+4. Run build script:
+
+   ```bash
+   ./build.sh
+   ```
+
+Tips:
+
+If you want to build again, after first build, it will edit or generate some files like `include/configs/mt7621-common.h` and `configs/mt7621_build_defconfig`, if you did't develop or edit the uboot, you can use args `git reset --hard HEAD` to remove these change, then build again.
 
 ## Board Parameters
 
